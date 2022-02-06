@@ -8,6 +8,7 @@ import voluptuous as vol
 from homeassistant.components.climate import PLATFORM_SCHEMA, ClimateEntity
 from homeassistant.components.climate.const import (
     ATTR_FAN_MODE,
+    ATTR_HUMIDITY,
     ATTR_HVAC_MODE,
     ATTR_PRESET_MODE,
     ATTR_SWING_MODE,
@@ -28,6 +29,7 @@ from homeassistant.components.climate.const import (
     SUPPORT_FAN_MODE,
     SUPPORT_PRESET_MODE,
     SUPPORT_SWING_MODE,
+    SUPPORT_TARGET_HUMIDITY,
     SUPPORT_TARGET_TEMPERATURE,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -43,6 +45,7 @@ from .const import (
     ATTR_OUTSIDE_TEMPERATURE,
     ATTR_STATE_OFF,
     ATTR_STATE_ON,
+    ATTR_TARGET_HUMIDITY,
     ATTR_TARGET_TEMPERATURE,
 )
 
@@ -58,6 +61,11 @@ HA_STATE_TO_DAIKIN = {
     HVAC_MODE_COOL: "cool",
     HVAC_MODE_HEAT: "hot",
     HVAC_MODE_HEAT_COOL: "auto",
+    HVAC_MODE_OFF: "off",
+}
+
+HA_STATE_TO_DAIKIN_CLEANER = {
+    HVAC_MODE_FAN_ONLY: "fan",
     HVAC_MODE_OFF: "off",
 }
 
@@ -83,6 +91,8 @@ HA_PRESET_TO_DAIKIN = {
     PRESET_ECO: "econo",
 }
 
+DAIKIN_TO_HA_PRESET = {val: k for k, val in HA_PRESET_TO_DAIKIN.items()}
+
 HA_ATTR_TO_DAIKIN = {
     ATTR_PRESET_MODE: "en_hol",
     ATTR_HVAC_MODE: "mode",
@@ -91,6 +101,7 @@ HA_ATTR_TO_DAIKIN = {
     ATTR_INSIDE_TEMPERATURE: "htemp",
     ATTR_OUTSIDE_TEMPERATURE: "otemp",
     ATTR_TARGET_TEMPERATURE: "stemp",
+    ATTR_TARGET_HUMIDITY: "shum",
 }
 
 DAIKIN_ATTR_ADVANCED = "adv"
@@ -125,12 +136,19 @@ class DaikinClimate(ClimateEntity):
 
         self._api = api
         self._list = {
-            ATTR_HVAC_MODE: list(HA_STATE_TO_DAIKIN),
             ATTR_FAN_MODE: self._api.device.fan_rate,
             ATTR_SWING_MODE: self._api.device.swing_modes,
         }
+        self._supported_features = 0
 
-        self._supported_features = SUPPORT_TARGET_TEMPERATURE
+        if self._api.device.support_target_temperature:
+            self._supported_features |= SUPPORT_TARGET_TEMPERATURE
+            self._list[ATTR_HVAC_MODE] = list(HA_STATE_TO_DAIKIN)
+        else:
+            self._list[ATTR_HVAC_MODE] = list(HA_STATE_TO_DAIKIN_CLEANER)
+
+        if self._api.device.support_target_humidity:
+            self._supported_features |= SUPPORT_TARGET_HUMIDITY
 
         if (
             self._api.device.support_away_mode
@@ -166,6 +184,13 @@ class DaikinClimate(ClimateEntity):
                     values[HA_ATTR_TO_DAIKIN[ATTR_TARGET_TEMPERATURE]] = str(int(value))
                 except ValueError:
                     _LOGGER.error("Invalid temperature %s", value)
+
+            # humidity
+            elif attr == ATTR_HUMIDITY:
+                try:
+                    values[HA_ATTR_TO_DAIKIN[ATTR_TARGET_HUMIDITY]] = str(int(value))
+                except ValueError:
+                    _LOGGER.error("Invalid humidity %s", value)
 
         if values:
             await self._api.device.set(values)
@@ -208,6 +233,23 @@ class DaikinClimate(ClimateEntity):
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
         await self._set(kwargs)
+
+    async def async_set_humidity(self, humidity):
+        """Set new target humidity."""
+        values = {}
+
+        try:
+            values[HA_ATTR_TO_DAIKIN[ATTR_TARGET_HUMIDITY]] = str(int(humidity))
+        except ValueError:
+            _LOGGER.error("Invalid humidity %s", humidity)
+
+        if values:
+            await self._api.device.set(values)
+
+    @property
+    def target_humidity(self):
+        """Return the humidity we try to reach."""
+        return self._api.device.represent(HA_ATTR_TO_DAIKIN[ATTR_TARGET_HUMIDITY])[1]
 
     @property
     def hvac_action(self):
@@ -267,45 +309,35 @@ class DaikinClimate(ClimateEntity):
     @property
     def preset_mode(self):
         """Return the preset_mode."""
-        if (
-            self._api.device.represent(HA_ATTR_TO_DAIKIN[ATTR_PRESET_MODE])[1]
-            == HA_PRESET_TO_DAIKIN[PRESET_AWAY]
-        ):
+        cur_preset = self._api.device.represent(HA_ATTR_TO_DAIKIN[ATTR_PRESET_MODE])[1]
+        if cur_preset == HA_PRESET_TO_DAIKIN[PRESET_AWAY]:
             return PRESET_AWAY
-        if (
-            HA_PRESET_TO_DAIKIN[PRESET_BOOST]
-            in self._api.device.represent(DAIKIN_ATTR_ADVANCED)[1]
-        ):
-            return PRESET_BOOST
-        if (
-            HA_PRESET_TO_DAIKIN[PRESET_ECO]
-            in self._api.device.represent(DAIKIN_ATTR_ADVANCED)[1]
-        ):
-            return PRESET_ECO
+
+        cur_preset = self._api.device.represent(DAIKIN_ATTR_ADVANCED)[1]
+        active_modes = cur_preset.split()
+        for mode in active_modes:
+            if mode == "streamer":
+                continue
+            return DAIKIN_TO_HA_PRESET.get(mode, mode)
+
         return PRESET_NONE
 
     async def async_set_preset_mode(self, preset_mode):
         """Set preset mode."""
-        if preset_mode == PRESET_AWAY:
-            await self._api.device.set_holiday(ATTR_STATE_ON)
-        elif preset_mode == PRESET_BOOST:
-            await self._api.device.set_advanced_mode(
-                HA_PRESET_TO_DAIKIN[PRESET_BOOST], ATTR_STATE_ON
-            )
-        elif preset_mode == PRESET_ECO:
-            await self._api.device.set_advanced_mode(
-                HA_PRESET_TO_DAIKIN[PRESET_ECO], ATTR_STATE_ON
-            )
-        else:
+        if preset_mode == PRESET_NONE:
             if self.preset_mode == PRESET_AWAY:
                 await self._api.device.set_holiday(ATTR_STATE_OFF)
-            elif self.preset_mode == PRESET_BOOST:
+            else:
                 await self._api.device.set_advanced_mode(
-                    HA_PRESET_TO_DAIKIN[PRESET_BOOST], ATTR_STATE_OFF
+                    HA_PRESET_TO_DAIKIN.get(self.preset_mode, self.preset_mode),
+                    ATTR_STATE_OFF,
                 )
-            elif self.preset_mode == PRESET_ECO:
+        else:
+            if preset_mode == PRESET_AWAY:
+                await self._api.device.set_holiday(ATTR_STATE_ON)
+            else:
                 await self._api.device.set_advanced_mode(
-                    HA_PRESET_TO_DAIKIN[PRESET_ECO], ATTR_STATE_OFF
+                    HA_PRESET_TO_DAIKIN.get(preset_mode, preset_mode), ATTR_STATE_ON
                 )
 
     @property
@@ -314,7 +346,10 @@ class DaikinClimate(ClimateEntity):
         ret = [PRESET_NONE]
         if self._api.device.support_away_mode:
             ret.append(PRESET_AWAY)
-        if self._api.device.support_advanced_modes:
+        if self._api.device.advanced_modes:
+            for mode in self._api.device.advanced_modes:
+                ret.append(DAIKIN_TO_HA_PRESET.get(mode, mode))
+        elif self._api.device.support_advanced_modes:
             ret += [PRESET_ECO, PRESET_BOOST]
         return ret
 
